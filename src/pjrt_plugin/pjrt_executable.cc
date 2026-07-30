@@ -1,5 +1,6 @@
 // PJRT Executable and LoadedExecutable API implementation for Metal backend
 
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -99,7 +100,29 @@ PJRT_Error* MPS_Executable_OutputDimensions(PJRT_Executable_OutputDimensions_Arg
 }
 
 PJRT_Error* MPS_Executable_OptimizedProgram(PJRT_Executable_OptimizedProgram_Args* args) {
-    return MakeError("OptimizedProgram not implemented", PJRT_Error_Code_UNIMPLEMENTED);
+    MPS_LOG_DEBUG(" PJRT_Executable_OptimizedProgram called\n");
+    if (!args->executable) {
+        return MakeError("Null executable", PJRT_Error_Code_INVALID_ARGUMENT);
+    }
+    // jax-mps maps StableHLO directly to MLX with no HLO-level optimization
+    // pass, so the optimized program equals the program the executable was
+    // compiled from (retained in MPS_Client_Compile).
+    const std::string& code = args->executable->program_bytes;
+    const std::string& fmt = args->executable->program_format;
+    PJRT_Program* program = args->program;
+    program->format = fmt.c_str();
+    program->format_size = fmt.size();
+    if (program->code == nullptr) {          // size query
+        program->code_size = code.size();
+        return nullptr;
+    }
+    if (program->code_size < code.size()) {
+        return MakeError("OptimizedProgram: caller buffer too small",
+                            PJRT_Error_Code_INVALID_ARGUMENT);
+    }
+    std::memcpy(program->code, code.data(), code.size());
+    program->code_size = code.size();
+    return nullptr;
 }
 
 PJRT_Error* MPS_Executable_Serialize(PJRT_Executable_Serialize_Args* args) {
