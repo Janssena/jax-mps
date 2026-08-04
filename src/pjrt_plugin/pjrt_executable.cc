@@ -112,13 +112,13 @@ PJRT_Error* MPS_Executable_OptimizedProgram(PJRT_Executable_OptimizedProgram_Arg
     PJRT_Program* program = args->program;
     program->format = fmt.c_str();
     program->format_size = fmt.size();
-    if (program->code == nullptr) {          // size query
+    if (program->code == nullptr) {  // size query
         program->code_size = code.size();
         return nullptr;
     }
     if (program->code_size < code.size()) {
         return MakeError("OptimizedProgram: caller buffer too small",
-                            PJRT_Error_Code_INVALID_ARGUMENT);
+                         PJRT_Error_Code_INVALID_ARGUMENT);
     }
     std::memcpy(program->code, code.data(), code.size());
     program->code_size = code.size();
