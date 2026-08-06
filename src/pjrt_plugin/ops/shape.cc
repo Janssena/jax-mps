@@ -1,6 +1,9 @@
 // Shape, type conversion, and data movement op handlers.
 
+#include <algorithm>
+#include <numeric>
 #include <unordered_set>
+#include <vector>
 
 #include "pjrt_plugin/ops/handler_utils.h"
 #include "stablehlo/dialect/StablehloOps.h"
@@ -71,16 +74,52 @@ bool HandleBroadcastInDim(mlir::Operation* op, ValueMap& values,
         }
     }
 
-    // Build the intermediate shape with 1s for non-broadcast dims
-    mlx::core::Shape intermediateShape(outputShape->size(), 1);
-    for (size_t i = 0; i < broadcastDims.size(); ++i) {
-        int64_t dim = broadcastDims[i];
-        if (static_cast<int>(i) < input->ndim()) {
-            intermediateShape[dim] = input->shape(static_cast<int>(i));
+    // broadcast_dimensions maps input axis i to output axis broadcastDims[i].
+    // Per the StableHLO spec (C4: is_unique, no monotonicity constraint) this
+    // may be unsorted, in which case the mapping transposes the input axes
+    // (e.g. dims=[2,1] swaps two axes; dims=[3,2,1] reverses three). Reshaping
+    // alone preserves the input's row-major element order, so for any
+    // non-ascending broadcastDims it would silently mis-map the axes and
+    // return transposed data.
+    //
+    // jax.lax.broadcast_in_dim itself has no sortedness check either (its own
+    // docstring demonstrates broadcast_dimensions=(1, 0) as "implicit
+    // transposes") and lowers it to this exact unsorted form -- so this is
+    // directly reachable from plain jax.jit, not just from frontends that run
+    // extra StableHLO optimization. In practice jax.numpy's higher-level ops
+    // never happen to construct a non-ascending call, which is how this went
+    // untested; it surfaced via Reactant, whose default optimizer rewrites the
+    // Evoformer's layernorm variance `reduce(add, multiply(x, x))` into a
+    // dot_general and restores its shape with broadcast_in_dim dims=[3,2,1]
+    // (EnzymeXLA's `reduce_mul_to_dot_general` pattern). Reorder the input
+    // axes so their targets are ascending first, then the reshape places each
+    // axis at the correct output dimension.
+    int inRank = static_cast<int>(input->ndim());
+    std::vector<int> axisOrder(inRank);
+    std::iota(axisOrder.begin(), axisOrder.end(), 0);
+    std::sort(axisOrder.begin(), axisOrder.end(),
+              [&](int a, int b) { return broadcastDims[a] < broadcastDims[b]; });
+
+    bool isAscending = true;
+    for (int i = 0; i < inRank; ++i) {
+        if (axisOrder[i] != i) {
+            isAscending = false;
+            break;
         }
     }
 
-    auto reshaped = mlx::core::reshape(*input, intermediateShape);
+    mlx::core::array reordered = isAscending ? *input : mlx::core::transpose(*input, axisOrder);
+
+    // After the (optional) transpose, axis j of `reordered` is original input
+    // axis axisOrder[j], whose target output dim broadcastDims[axisOrder[j]] is
+    // now ascending in j -- so a reshape into the output-rank shape is layout
+    // correct.
+    mlx::core::Shape intermediateShape(outputShape->size(), 1);
+    for (int j = 0; j < inRank; ++j) {
+        intermediateShape[broadcastDims[axisOrder[j]]] = reordered.shape(j);
+    }
+
+    auto reshaped = mlx::core::reshape(reordered, intermediateShape);
     values.emplace(ToKey(op->getResult(0)), mlx::core::broadcast_to(reshaped, *outputShape));
     return true;
 }

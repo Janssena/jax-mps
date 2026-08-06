@@ -281,6 +281,117 @@ module @test {{
     numpy.testing.assert_allclose(result, expected, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.parametrize(
+    "in_shape,out_shape,broadcast_dims",
+    [
+        # Rank-increasing swap: input axes 0,1 map to output axes 1,0 while a
+        # new size-1 axis is inserted. Non-ascending, so it reaches this handler
+        # (a rank-preserving pure transpose would be canonicalized to
+        # stablehlo.transpose upstream and never hit broadcast_in_dim).
+        pytest.param((2, 3), (3, 2, 1), [1, 0], id="swap_expand"),
+        # Rank-increasing permutation: the exact shape AlphaFold's Evoformer
+        # produces (a dot_general result reshaped back to pair-rep layout).
+        pytest.param((1, 4, 5), (1, 5, 4, 1), [3, 2, 1], id="evoformer_pair"),
+        # Ascending dims must keep working (the common, unaffected path).
+        pytest.param((4, 5), (4, 5, 3), [0, 1], id="ascending_expand"),
+    ],
+)
+def test_broadcast_in_dim_permuted(in_shape, out_shape, broadcast_dims) -> None:
+    """stablehlo.broadcast_in_dim with non-ascending broadcast_dimensions.
+
+    StableHLO allows broadcast_dimensions to be unsorted, which encodes an axis
+    permutation (a transpose), not just size-1-dim insertion. Reshaping alone
+    (the old handler) preserves row-major order and silently returns transposed
+    data. This is unreachable through jax.lax.broadcast_in_dim (which requires
+    increasing dims), so it is tested via raw StableHLO -- it is exactly what
+    Reactant/torchax emit for AlphaFold's Evoformer (jax-mps Evoformer bug).
+    """
+    OperationTestConfig.EXERCISED_STABLEHLO_OPS.add("stablehlo.broadcast_in_dim")
+    if TEST_MODE == "cpu":
+        pytest.skip("MPS-specific test skipped in CPU-only mode")
+
+    from jax._src import xla_bridge
+    from jaxlib import xla_client
+
+    in_ty = "x".join(str(d) for d in in_shape)
+    out_ty = "x".join(str(d) for d in out_shape)
+    dims_txt = ", ".join(str(d) for d in broadcast_dims)
+    stablehlo_text = f"""
+module @test {{
+  func.func @main(%arg0: tensor<{in_ty}xf32>) -> tensor<{out_ty}xf32> {{
+    %0 = stablehlo.broadcast_in_dim %arg0, dims = [{dims_txt}] : (tensor<{in_ty}xf32>) -> tensor<{out_ty}xf32>
+    return %0 : tensor<{out_ty}xf32>
+  }}
+}}
+"""
+
+    client = xla_bridge.get_backend("mps")
+    devices = client.local_devices()
+    device_list = xla_client.DeviceList(tuple(devices[:1]))
+    exe = client.compile_and_load(stablehlo_text.encode(), device_list)
+
+    x = numpy.arange(numpy.prod(in_shape), dtype=numpy.float32).reshape(in_shape)
+    buf = jax.device_put(x, devices[0])
+    result = numpy.asarray(exe.execute([buf])[0])
+
+    # Reference: place each input axis at its target output dim, size-1 elsewhere,
+    # then broadcast -- using numpy.transpose (a trusted primitive) for the
+    # permutation the old handler omitted.
+    order = sorted(range(x.ndim), key=lambda i: broadcast_dims[i])
+    inter = [1] * len(out_shape)
+    for i in order:
+        inter[broadcast_dims[i]] = x.shape[i]
+    expected = numpy.broadcast_to(numpy.transpose(x, order).reshape(inter), out_shape)
+    numpy.testing.assert_allclose(result, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_reduce_mul_to_dot_general_shape() -> None:
+    """End-to-end shape that EnzymeXLA's reduce_mul_to_dot_general emits.
+
+    Reactant's default optimizer rewrites the Evoformer's layernorm variance
+    `reduce(add, multiply(x, x))` into a batched dot_general whose result is
+    restored with a *permuting* broadcast_in_dim (dims=[3,2,1]). This is the
+    exact module the plugin receives on the Reactant path; jax.jit never
+    produces it. Regression for the transposed-output bug that broke AlphaFold's
+    Evoformer on Metal. Uses two distinct spatial sizes (4, 5) so a swapped-axis
+    result cannot accidentally match the reference.
+    """
+    OperationTestConfig.EXERCISED_STABLEHLO_OPS.add("stablehlo.dot_general")
+    OperationTestConfig.EXERCISED_STABLEHLO_OPS.add("stablehlo.broadcast_in_dim")
+    if TEST_MODE == "cpu":
+        pytest.skip("MPS-specific test skipped in CPU-only mode")
+
+    from jax._src import xla_bridge
+    from jaxlib import xla_client
+
+    # arg layout (K, A=4, B=5, 1). dot_general batches axes [3,2,1] and contracts
+    # axis 0 (K), giving (1, B, A); broadcast_in_dim dims=[3,2,1] restores it to
+    # (1, A, B, 1). The two non-ascending dims (2, 1) mean the handler must
+    # transpose A<->B -- with A != B a reshape-only handler yields wrong values.
+    stablehlo_text = """
+module @test {
+  func.func @main(%arg0: tensor<7x4x5x1xf32>) -> tensor<1x4x5x1xf32> {
+    %0 = stablehlo.dot_general %arg0, %arg0, batching_dims = [3, 2, 1] x [3, 2, 1], contracting_dims = [0] x [0] : (tensor<7x4x5x1xf32>, tensor<7x4x5x1xf32>) -> tensor<1x5x4xf32>
+    %1 = stablehlo.broadcast_in_dim %0, dims = [3, 2, 1] : (tensor<1x5x4xf32>) -> tensor<1x4x5x1xf32>
+    return %1 : tensor<1x4x5x1xf32>
+  }
+}
+"""
+    client = xla_bridge.get_backend("mps")
+    devices = client.local_devices()
+    device_list = xla_client.DeviceList(tuple(devices[:1]))
+    exe = client.compile_and_load(stablehlo_text.encode(), device_list)
+
+    x = numpy.arange(7 * 4 * 5, dtype=numpy.float32).reshape(7, 4, 5, 1)
+    buf = jax.device_put(x, devices[0])
+    result = numpy.asarray(exe.execute([buf])[0])
+
+    # Reference: sum of squares over the contracted axis K, restored to
+    # (1, A, B, 1) -- i.e. result[0, a, b, 0] = sum_K x[K, a, b, 0]**2.
+    expected = (x * x).sum(axis=0)[numpy.newaxis]  # (1, 4, 5, 1)
+    numpy.testing.assert_allclose(result, expected, atol=1e-5, rtol=1e-5)
+
+
 def test_unsupported_op_error_message(jit: bool) -> None:
     """Check that unsupported-op errors link to the issue template and CONTRIBUTING.md."""
     if TEST_MODE == "cpu":
