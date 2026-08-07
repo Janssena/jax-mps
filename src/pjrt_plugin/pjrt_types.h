@@ -64,13 +64,6 @@ struct PJRT_Executable {
     std::unique_ptr<jax_mps::MlxExecutable> executable;
     PJRT_Client* client;
 
-    // Serialized program the executable was compiled from, retained so
-    // PJRT_Executable_OptimizedProgram can return it. jax-mps maps StableHLO
-    // directly to MLX with no HLO-level optimization pass, so the "optimized"
-    // program is identical to the input program.
-    std::string program_bytes;
-    std::string program_format;
-
     // Ownership flag: when true, this executable is owned by a PJRT_LoadedExecutable
     // and should not be deleted directly by PJRT_Executable_Destroy
     bool owned_by_loaded = false;
