@@ -104,14 +104,27 @@ PJRT_Error* MPS_Executable_OptimizedProgram(PJRT_Executable_OptimizedProgram_Arg
     if (!args->executable) {
         return MakeError("Null executable", PJRT_Error_Code_INVALID_ARGUMENT);
     }
-    // jax-mps maps StableHLO directly to MLX with no HLO-level optimization
-    // pass, so the optimized program equals the program the executable was
-    // compiled from (retained in MPS_Client_Compile).
-    const std::string& code = args->executable->program_bytes;
-    const std::string& fmt = args->executable->program_format;
+    if (!args->program) {
+        return MakeError("OptimizedProgram: null program", PJRT_Error_Code_INVALID_ARGUMENT);
+    }
+    // jax-mps runs StableHLO algebraic simplification plus MpsFusionPass
+    // (stablehlo_parser.cc) before execution, so the program this executable was
+    // compiled from is not what actually ran. Return the post-pass module that
+    // MlxExecutable walks, printed the way JAX_MPS_DUMP_OPTIMIZED_IR prints it.
+    args->executable->initOptimizedProgram();
+    const std::string& code = args->executable->optimized_program;
+    if (code.empty()) {
+        // No module to print. Fail loudly rather than handing back a zero-byte
+        // program the caller would only reject later with a confusing parse error.
+        return MakeError("OptimizedProgram: executable has no module to print",
+                         PJRT_Error_Code_FAILED_PRECONDITION);
+    }
+    // MLIR assembly. MLIR's parser auto-detects text vs bytecode, so "mlir" is
+    // accurate regardless of which form the program was originally compiled from.
+    static constexpr char kFormat[] = "mlir";
     PJRT_Program* program = args->program;
-    program->format = fmt.c_str();
-    program->format_size = fmt.size();
+    program->format = kFormat;
+    program->format_size = sizeof(kFormat) - 1;
     if (program->code == nullptr) {          // size query
         program->code_size = code.size();
         return nullptr;

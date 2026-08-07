@@ -245,11 +245,6 @@ PJRT_Error* MPS_Client_Compile(PJRT_Client_Compile_Args* args) {
     executable->client = client;
     executable->owned_by_loaded = true;  // Mark as owned by LoadedExecutable
 
-    // Retain the program so PJRT_Executable_OptimizedProgram can return it
-    // (consumed e.g. by Reactant.jl during compilation).
-    executable->program_bytes.assign(args->program->code, args->program->code_size);
-    executable->program_format.assign(args->program->format, args->program->format_size);
-
     // Wrap in LoadedExecutable
     auto* loaded_executable = new PJRT_LoadedExecutable();
     loaded_executable->executable = executable;

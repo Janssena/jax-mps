@@ -64,13 +64,6 @@ struct PJRT_Executable {
     std::unique_ptr<jax_mps::MlxExecutable> executable;
     PJRT_Client* client;
 
-    // Serialized program the executable was compiled from, retained so
-    // PJRT_Executable_OptimizedProgram can return it. jax-mps maps StableHLO
-    // directly to MLX with no HLO-level optimization pass, so the "optimized"
-    // program is identical to the input program.
-    std::string program_bytes;
-    std::string program_format;
-
     // Ownership flag: when true, this executable is owned by a PJRT_LoadedExecutable
     // and should not be deleted directly by PJRT_Executable_Destroy
     bool owned_by_loaded = false;
@@ -91,6 +84,24 @@ struct PJRT_Executable {
             output_types.resize(num_outputs, PJRT_Buffer_Type_F32);
             output_dims.resize(num_outputs * 8, 0);  // up to 8 dims per output
             output_dim_sizes.resize(num_outputs, 0);
+        });
+    }
+
+    // MLIR assembly returned by PJRT_Executable_OptimizedProgram (consumed e.g.
+    // by Reactant.jl during compilation). jax-mps runs StableHLO simplification
+    // + MpsFusionPass before execution (stablehlo_parser.cc), so this is printed
+    // from the post-pass module MlxExecutable actually walks, not the program
+    // the executable was compiled from. Printed once and cached: PJRT's protocol
+    // is a size query followed by a fill, and the two must agree on the size or
+    // the caller's buffer overflows. Empty if there is no module to print.
+    mutable std::string optimized_program;
+    mutable std::once_flag optimized_program_flag;
+
+    void initOptimizedProgram() const {
+        std::call_once(optimized_program_flag, [this] {
+            if (executable) {
+                optimized_program = executable->OptimizedModuleText();
+            }
         });
     }
 };
