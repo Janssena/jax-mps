@@ -65,12 +65,46 @@ bool HandleBroadcastInDim(mlir::Operation* op, ValueMap& values,
 
     auto broadcastDims = broadcastOp.getBroadcastDimensions();
 
-    // Validate broadcast dimensions are in bounds
+    // Validate broadcast dimensions are in bounds (spec C3)
     for (int64_t dim : broadcastDims) {
         if (dim < 0 || static_cast<size_t>(dim) >= outputShape->size()) {
             MPS_LOG_ERROR("stablehlo.broadcast_in_dim: dimension %lld out of bounds [0, %zu)\n",
                           dim, outputShape->size());
             return false;
+        }
+    }
+
+    // Spec C2: size(broadcast_dimensions) == rank(operand). The axis reordering
+    // below indexes broadcastDims once per input axis, so a short list would
+    // read past the attribute -- an out-of-bounds read, not just a wrong answer.
+    //
+    // Like the C3 check above, this is defense-in-depth: StableHLO's verifier
+    // rejects all three constraints at parse time ("broadcast_dimensions size
+    // (1) does not match operand rank (2)"), so a module reaching this handler
+    // has already been validated and these branches are not reachable through
+    // the normal compile path -- they cannot be covered by a test that goes
+    // through compile_and_load. They are kept so the handler is safe on its own
+    // terms if it is ever handed unverified IR.
+    if (broadcastDims.size() != input->ndim()) {
+        MPS_LOG_ERROR(
+            "stablehlo.broadcast_in_dim: broadcast_dimensions size %zu != operand rank %d\n",
+            broadcastDims.size(), static_cast<int>(input->ndim()));
+        return false;
+    }
+
+    // Spec C4: is_unique(broadcast_dimensions). Duplicates would make two input
+    // axes claim the same output dimension, silently dropping one of them (the
+    // intermediate shape entry is overwritten) and leaving the reshape below to
+    // fail on an element-count mismatch instead of reporting the real cause.
+    // Verifier-enforced too ("broadcast_dimensions should not have duplicates"),
+    // so this is unreachable via compile_and_load -- see the note on C2 above.
+    for (size_t i = 0; i < broadcastDims.size(); ++i) {
+        for (size_t j = i + 1; j < broadcastDims.size(); ++j) {
+            if (broadcastDims[i] == broadcastDims[j]) {
+                MPS_LOG_ERROR("stablehlo.broadcast_in_dim: duplicate broadcast dimension %lld\n",
+                              broadcastDims[i]);
+                return false;
+            }
         }
     }
 

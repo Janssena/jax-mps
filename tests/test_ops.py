@@ -294,6 +294,38 @@ module @test {{
         pytest.param((1, 4, 5), (1, 5, 4, 1), [3, 2, 1], id="evoformer_pair"),
         # Ascending dims must keep working (the common, unaffected path).
         pytest.param((4, 5), (4, 5, 3), [0, 1], id="ascending_expand"),
+        # Size-1 axis STRETCHED under a permutation: spec C5 lets an operand dim
+        # of 1 broadcast to a larger result dim, and here that coincides with a
+        # non-ascending mapping. Input axis 0 (size 1) -> output axis 2 (size 6,
+        # stretched); axis 1 (size 4) -> output axis 1; axis 2 (size 5) -> output
+        # axis 0. The transpose and the stretch have to compose in the right
+        # order, which neither a pure-permutation nor a pure-stretch case checks.
+        pytest.param((1, 4, 5), (5, 4, 6), [2, 1, 0], id="permuted_stretch"),
+        # Rank 5->6, 5-element permutation, taken verbatim from a dumped
+        # OptimizedProgram module of a real openfold Evoformer forward
+        # (JAX_MPS_DUMP_OPTIMIZED_IR): `broadcast_in_dim %112, dims = [3, 0, 4, 1,
+        # 2] : (tensor<1x800x512x8x32xf32>) -> tensor<800x8x32x1x512x1xf32>`. The
+        # earlier cases only cover rank<=3 permutations; production Evoformer
+        # attention reshapes go through rank 4-5 broadcasts that none of them
+        # exercise, so this pins the handler at the rank the model actually uses.
+        pytest.param(
+            (1, 800, 512, 8, 32),
+            (800, 8, 32, 1, 512, 1),
+            [3, 0, 4, 1, 2],
+            id="evoformer_attention_rank5",
+        ),
+        # Same provenance, adjacent op in the dump: rank 5->5 where the
+        # permutation ALSO stretches a size-1 axis (input axis 2 has size 1,
+        # target output axis 4 has size 512) -- `broadcast_in_dim %138, dims =
+        # [0, 1, 4, 3, 2] : (tensor<1x800x1x8x512xf32>) ->
+        # tensor<1x800x512x8x32xf32>`. Exercises stretch-under-permutation at
+        # production rank, complementing the smaller permuted_stretch case above.
+        pytest.param(
+            (1, 800, 1, 8, 512),
+            (1, 800, 512, 8, 32),
+            [0, 1, 4, 3, 2],
+            id="evoformer_attention_rank5_stretch",
+        ),
     ],
 )
 def test_broadcast_in_dim_permuted(in_shape, out_shape, broadcast_dims) -> None:
@@ -302,9 +334,17 @@ def test_broadcast_in_dim_permuted(in_shape, out_shape, broadcast_dims) -> None:
     StableHLO allows broadcast_dimensions to be unsorted, which encodes an axis
     permutation (a transpose), not just size-1-dim insertion. Reshaping alone
     (the old handler) preserves row-major order and silently returns transposed
-    data. This is unreachable through jax.lax.broadcast_in_dim (which requires
-    increasing dims), so it is tested via raw StableHLO -- it is exactly what
-    Reactant/torchax emit for AlphaFold's Evoformer (jax-mps Evoformer bug).
+    data.
+
+    Raw StableHLO is used here to pin the exact rank-increasing permutations the
+    handler must get right (including the Evoformer's dims=[3,2,1]) independently
+    of JAX tracing -- NOT because JAX cannot express them. jax.lax.broadcast_in_dim
+    accepts unsorted broadcast_dimensions and lowers them verbatim (jax.jit of
+    broadcast_dimensions=(1, 0) emits `dims = [1, 0]`), so this bug is reachable
+    from plain jax.jit as well as from Reactant/torchax; the
+    broadcast_in_dim-nonascending-dims config in tests/configs/shape.py covers
+    that JAX-level path. It went untested simply because no existing test
+    happened to use an unsorted list, not because one was impossible to write.
     """
     OperationTestConfig.EXERCISED_STABLEHLO_OPS.add("stablehlo.broadcast_in_dim")
     if TEST_MODE == "cpu":
