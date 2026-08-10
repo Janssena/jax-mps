@@ -323,12 +323,12 @@ def test_broadcast_in_dim_permuted(in_shape, out_shape, broadcast_dims) -> None:
     (the old handler) preserves row-major order and silently returns transposed
     data.
 
-    Raw StableHLO is used here to pin exact broadcast_dimensions lists 
-    independently of JAX tracing. jax.lax.broadcast_in_dim accepts unsorted 
-    broadcast_dimensions and lowers them verbatim (jax.jit of 
-    broadcast_dimensions=(1, 0) emits `dims = [1,0]`); the 
-    broadcast_in_dim-nonascending-dims config in tests/configs/shape.py covers 
-    that path. It went untested simply because no existing test happened to use 
+    Raw StableHLO is used here to pin exact broadcast_dimensions lists
+    independently of JAX tracing. jax.lax.broadcast_in_dim accepts unsorted
+    broadcast_dimensions and lowers them verbatim (jax.jit of
+    broadcast_dimensions=(1, 0) emits `dims = [1,0]`); the
+    broadcast_in_dim-nonascending-dims config in tests/configs/shape.py covers
+    that path. It went untested simply because no existing test happened to use
     an unsorted list.
     """
     OperationTestConfig.EXERCISED_STABLEHLO_OPS.add("stablehlo.broadcast_in_dim")
