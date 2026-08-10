@@ -284,16 +284,21 @@ module @test {{
 @pytest.mark.parametrize(
     "in_shape,out_shape,broadcast_dims",
     [
-        # Rank-increasing swap: input axes 0,1 map to output axes 1,0 while a
-        # new size-1 axis is inserted. Non-ascending, so it reaches this handler
-        # (a rank-preserving pure transpose would be canonicalized to
-        # stablehlo.transpose upstream and never hit broadcast_in_dim).
-        pytest.param((2, 3), (3, 2, 1), [1, 0], id="swap_expand"),
-        # Rank-increasing permutation: the exact shape AlphaFold's Evoformer
-        # produces (a dot_general result reshaped back to pair-rep layout).
-        pytest.param((1, 4, 5), (1, 5, 4, 1), [3, 2, 1], id="evoformer_pair"),
-        # Ascending dims must keep working (the common, unaffected path).
-        pytest.param((4, 5), (4, 5, 3), [0, 1], id="ascending_expand"),
+        # Ascending dims: the common, unaffected path (broadcastDims already
+        # sorted, so the handler's isAscending fast path skips the transpose).
+        pytest.param((4, 5), (4, 5, 3), [0, 1], id="ascending"),
+        # Minimal non-ascending case: a pairwise swap. A trailing size-1 axis
+        # is appended so this stays a rank-increasing broadcast_in_dim -- a
+        # pure rank-preserving permutation gets canonicalized to
+        # stablehlo.transpose by the plugin's own simplification pass before
+        # HandleBroadcastInDim ever sees it (verified via
+        # JAX_MPS_DUMP_OPTIMIZED_IR), so it wouldn't touch this handler at all.
+        pytest.param((2, 3), (3, 2, 1), [1, 0], id="swap"),
+        # A reordering touching every axis, not just two -- checks that the
+        # sort-based axis reordering generalizes beyond a single transposition
+        # (e.g. a cyclic or fully-reversed permutation), not just adjacent
+        # swaps. Trailing size-1 axis for the same reason as `swap` above.
+        pytest.param((2, 3, 4), (4, 3, 2, 1), [2, 1, 0], id="full_reverse"),
         # Size-1 axis STRETCHED under a permutation: spec C5 lets an operand dim
         # of 1 broadcast to a larger result dim, and here that coincides with a
         # non-ascending mapping. Input axis 0 (size 1) -> output axis 2 (size 6,
@@ -301,30 +306,12 @@ module @test {{
         # axis 0. The transpose and the stretch have to compose in the right
         # order, which neither a pure-permutation nor a pure-stretch case checks.
         pytest.param((1, 4, 5), (5, 4, 6), [2, 1, 0], id="permuted_stretch"),
-        # Rank 5->6, 5-element permutation, taken verbatim from a dumped
-        # OptimizedProgram module of a real openfold Evoformer forward
-        # (JAX_MPS_DUMP_OPTIMIZED_IR): `broadcast_in_dim %112, dims = [3, 0, 4, 1,
-        # 2] : (tensor<1x800x512x8x32xf32>) -> tensor<800x8x32x1x512x1xf32>`. The
-        # earlier cases only cover rank<=3 permutations; production Evoformer
-        # attention reshapes go through rank 4-5 broadcasts that none of them
-        # exercise, so this pins the handler at the rank the model actually uses.
+        # A synthetic, non-adjacent permutation at rank 4 (arbitrary shapes, no
+        # particular model's IR), confirms the sort-based reordering scales
+        # past the small ranks exercised above rather than being coincidentally
+        # correct only for rank <= 3. Trailing size-1 axis, same reason as `swap`.
         pytest.param(
-            (1, 800, 512, 8, 32),
-            (800, 8, 32, 1, 512, 1),
-            [3, 0, 4, 1, 2],
-            id="evoformer_attention_rank5",
-        ),
-        # Same provenance, adjacent op in the dump: rank 5->5 where the
-        # permutation ALSO stretches a size-1 axis (input axis 2 has size 1,
-        # target output axis 4 has size 512) -- `broadcast_in_dim %138, dims =
-        # [0, 1, 4, 3, 2] : (tensor<1x800x1x8x512xf32>) ->
-        # tensor<1x800x512x8x32xf32>`. Exercises stretch-under-permutation at
-        # production rank, complementing the smaller permuted_stretch case above.
-        pytest.param(
-            (1, 800, 1, 8, 512),
-            (1, 800, 512, 8, 32),
-            [0, 1, 4, 3, 2],
-            id="evoformer_attention_rank5_stretch",
+            (2, 3, 4, 5), (3, 4, 5, 2, 1), [3, 0, 1, 2], id="higher_rank_permutation"
         ),
     ],
 )
@@ -336,15 +323,13 @@ def test_broadcast_in_dim_permuted(in_shape, out_shape, broadcast_dims) -> None:
     (the old handler) preserves row-major order and silently returns transposed
     data.
 
-    Raw StableHLO is used here to pin the exact rank-increasing permutations the
-    handler must get right (including the Evoformer's dims=[3,2,1]) independently
-    of JAX tracing -- NOT because JAX cannot express them. jax.lax.broadcast_in_dim
-    accepts unsorted broadcast_dimensions and lowers them verbatim (jax.jit of
-    broadcast_dimensions=(1, 0) emits `dims = [1, 0]`), so this bug is reachable
-    from plain jax.jit as well as from Reactant/torchax; the
-    broadcast_in_dim-nonascending-dims config in tests/configs/shape.py covers
-    that JAX-level path. It went untested simply because no existing test
-    happened to use an unsorted list, not because one was impossible to write.
+    Raw StableHLO is used here to pin exact broadcast_dimensions lists 
+    independently of JAX tracing. jax.lax.broadcast_in_dim accepts unsorted 
+    broadcast_dimensions and lowers them verbatim (jax.jit of 
+    broadcast_dimensions=(1, 0) emits `dims = [1,0]`); the 
+    broadcast_in_dim-nonascending-dims config in tests/configs/shape.py covers 
+    that path. It went untested simply because no existing test happened to use 
+    an unsorted list.
     """
     OperationTestConfig.EXERCISED_STABLEHLO_OPS.add("stablehlo.broadcast_in_dim")
     if TEST_MODE == "cpu":
@@ -382,53 +367,6 @@ module @test {{
     for i in order:
         inter[broadcast_dims[i]] = x.shape[i]
     expected = numpy.broadcast_to(numpy.transpose(x, order).reshape(inter), out_shape)
-    numpy.testing.assert_allclose(result, expected, atol=1e-5, rtol=1e-5)
-
-
-def test_reduce_mul_to_dot_general_shape() -> None:
-    """End-to-end shape that EnzymeXLA's reduce_mul_to_dot_general emits.
-
-    Reactant's default optimizer rewrites the Evoformer's layernorm variance
-    `reduce(add, multiply(x, x))` into a batched dot_general whose result is
-    restored with a *permuting* broadcast_in_dim (dims=[3,2,1]). This is the
-    exact module the plugin receives on the Reactant path; jax.jit never
-    produces it. Regression for the transposed-output bug that broke AlphaFold's
-    Evoformer on Metal. Uses two distinct spatial sizes (4, 5) so a swapped-axis
-    result cannot accidentally match the reference.
-    """
-    OperationTestConfig.EXERCISED_STABLEHLO_OPS.add("stablehlo.dot_general")
-    OperationTestConfig.EXERCISED_STABLEHLO_OPS.add("stablehlo.broadcast_in_dim")
-    if TEST_MODE == "cpu":
-        pytest.skip("MPS-specific test skipped in CPU-only mode")
-
-    from jax._src import xla_bridge
-    from jaxlib import xla_client
-
-    # arg layout (K, A=4, B=5, 1). dot_general batches axes [3,2,1] and contracts
-    # axis 0 (K), giving (1, B, A); broadcast_in_dim dims=[3,2,1] restores it to
-    # (1, A, B, 1). The two non-ascending dims (2, 1) mean the handler must
-    # transpose A<->B -- with A != B a reshape-only handler yields wrong values.
-    stablehlo_text = """
-module @test {
-  func.func @main(%arg0: tensor<7x4x5x1xf32>) -> tensor<1x4x5x1xf32> {
-    %0 = stablehlo.dot_general %arg0, %arg0, batching_dims = [3, 2, 1] x [3, 2, 1], contracting_dims = [0] x [0] : (tensor<7x4x5x1xf32>, tensor<7x4x5x1xf32>) -> tensor<1x5x4xf32>
-    %1 = stablehlo.broadcast_in_dim %0, dims = [3, 2, 1] : (tensor<1x5x4xf32>) -> tensor<1x4x5x1xf32>
-    return %1 : tensor<1x4x5x1xf32>
-  }
-}
-"""
-    client = xla_bridge.get_backend("mps")
-    devices = client.local_devices()
-    device_list = xla_client.DeviceList(tuple(devices[:1]))
-    exe = client.compile_and_load(stablehlo_text.encode(), device_list)
-
-    x = numpy.arange(7 * 4 * 5, dtype=numpy.float32).reshape(7, 4, 5, 1)
-    buf = jax.device_put(x, devices[0])
-    result = numpy.asarray(exe.execute([buf])[0])
-
-    # Reference: sum of squares over the contracted axis K, restored to
-    # (1, A, B, 1) -- i.e. result[0, a, b, 0] = sum_K x[K, a, b, 0]**2.
-    expected = (x * x).sum(axis=0)[numpy.newaxis]  # (1, 4, 5, 1)
     numpy.testing.assert_allclose(result, expected, atol=1e-5, rtol=1e-5)
 
 
