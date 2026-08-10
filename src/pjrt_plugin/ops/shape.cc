@@ -74,17 +74,12 @@ bool HandleBroadcastInDim(mlir::Operation* op, ValueMap& values,
         }
     }
 
-    // Spec C2: size(broadcast_dimensions) == rank(operand). The axis reordering
-    // below indexes broadcastDims once per input axis, so a short list would
-    // read past the attribute -- an out-of-bounds read, not just a wrong answer.
-    //
-    // Like the C3 check above, this is defense-in-depth: StableHLO's verifier
-    // rejects all three constraints at parse time ("broadcast_dimensions size
-    // (1) does not match operand rank (2)"), so a module reaching this handler
-    // has already been validated and these branches are not reachable through
-    // the normal compile path -- they cannot be covered by a test that goes
-    // through compile_and_load. They are kept so the handler is safe on its own
-    // terms if it is ever handed unverified IR.
+    // Validate size(broadcast_dimensions) == rank(operand). Note: StableHLO's 
+    // verifier rejects code not meeting this constraint at parse time 
+    // ("broadcast_dimensions size (1) does not match operand rank (2)"), so a 
+    // module reaching this handler has already been validated and these branches 
+    // are not reachable through the normal compile path. They are kept so the 
+    // handler is safe on its own terms if it is ever handed unverified IR.
     if (broadcastDims.size() != input->ndim()) {
         MPS_LOG_ERROR(
             "stablehlo.broadcast_in_dim: broadcast_dimensions size %zu != operand rank %d\n",
@@ -92,12 +87,11 @@ bool HandleBroadcastInDim(mlir::Operation* op, ValueMap& values,
         return false;
     }
 
-    // Spec C4: is_unique(broadcast_dimensions). Duplicates would make two input
-    // axes claim the same output dimension, silently dropping one of them (the
-    // intermediate shape entry is overwritten) and leaving the reshape below to
-    // fail on an element-count mismatch instead of reporting the real cause.
-    // Verifier-enforced too ("broadcast_dimensions should not have duplicates"),
-    // so this is unreachable via compile_and_load -- see the note on C2 above.
+    // Validate broadcast dimensions are unique. Duplicates would make two input
+    // axes claim the same output dimension, silently dropping one of them and 
+    // leaving the reshape below to fail on an element-count mismatch instead of 
+    // reporting the real cause. Also verifier-enforced so this is unreachable 
+    // via compile_and_load, see the note on C2 above.
     for (size_t i = 0; i < broadcastDims.size(); ++i) {
         for (size_t j = i + 1; j < broadcastDims.size(); ++j) {
             if (broadcastDims[i] == broadcastDims[j]) {
@@ -109,25 +103,14 @@ bool HandleBroadcastInDim(mlir::Operation* op, ValueMap& values,
     }
 
     // broadcast_dimensions maps input axis i to output axis broadcastDims[i].
-    // Per the StableHLO spec (C4: is_unique, no monotonicity constraint) this
-    // may be unsorted, in which case the mapping transposes the input axes
-    // (e.g. dims=[2,1] swaps two axes; dims=[3,2,1] reverses three). Reshaping
-    // alone preserves the input's row-major element order, so for any
-    // non-ascending broadcastDims it would silently mis-map the axes and
-    // return transposed data.
-    //
-    // jax.lax.broadcast_in_dim itself has no sortedness check either (its own
-    // docstring demonstrates broadcast_dimensions=(1, 0) as "implicit
-    // transposes") and lowers it to this exact unsorted form -- so this is
-    // directly reachable from plain jax.jit, not just from frontends that run
-    // extra StableHLO optimization. In practice jax.numpy's higher-level ops
-    // never happen to construct a non-ascending call, which is how this went
-    // untested; it surfaced via Reactant, whose default optimizer rewrites the
-    // Evoformer's layernorm variance `reduce(add, multiply(x, x))` into a
-    // dot_general and restores its shape with broadcast_in_dim dims=[3,2,1]
-    // (EnzymeXLA's `reduce_mul_to_dot_general` pattern). Reorder the input
-    // axes so their targets are ascending first, then the reshape places each
-    // axis at the correct output dimension.
+    // Per the StableHLO spec this may be unsorted, in which case the mapping 
+    // transposes the input axes (e.g. dims=[2,1] swaps two axes; dims=[3,2,1] 
+    // reverses three). Reshaping alone preserves the input's row-major element 
+    // order, so for any non-ascending broadcastDims it would silently mis-map 
+    // the axes and return transposed data. In practice jax.numpy's higher-level 
+    // ops never happen to construct a non-ascending call, which is how this went
+    // untested. Fix: Reorder the input axes so their targets are ascending first, 
+    // then the reshape places each axis at the correct output dimension.
     int inRank = static_cast<int>(input->ndim());
     std::vector<int> axisOrder(inRank);
     std::iota(axisOrder.begin(), axisOrder.end(), 0);
@@ -146,7 +129,7 @@ bool HandleBroadcastInDim(mlir::Operation* op, ValueMap& values,
 
     // After the (optional) transpose, axis j of `reordered` is original input
     // axis axisOrder[j], whose target output dim broadcastDims[axisOrder[j]] is
-    // now ascending in j -- so a reshape into the output-rank shape is layout
+    // now ascending in j, so a reshape into the output-rank shape is layout
     // correct.
     mlx::core::Shape intermediateShape(outputShape->size(), 1);
     for (int j = 0; j < inRank; ++j) {
