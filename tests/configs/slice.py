@@ -5,6 +5,22 @@ from jax import numpy as jnp
 
 from .util import OperationTestConfig, complex_standard_normal
 
+# A (2, 3) window scattered at a two-element start index.
+_WINDOW_2D_DNUMS = lax.ScatterDimensionNumbers(
+    update_window_dims=(0, 1),
+    inserted_window_dims=(),
+    scatter_dims_to_operand_dims=(0, 1),
+)
+# The same window over operand dims (0, 2) of a [rows, batch, cols] operand,
+# batched over operand dim 1 and index dim 0.
+_WINDOW_2D_INTERIOR_BATCH_DNUMS = lax.ScatterDimensionNumbers(
+    update_window_dims=(1, 2),
+    inserted_window_dims=(),
+    scatter_dims_to_operand_dims=(0, 2),
+    operand_batching_dims=(1,),
+    scatter_indices_batching_dims=(0,),
+)
+
 
 def make_slice_op_configs():
     with OperationTestConfig.module_name("slice"):
@@ -376,6 +392,74 @@ def make_slice_op_configs():
                 lambda key: random.normal(key, (3, 2)),
                 name="batched_window_scatter_add",
             ),
+            # Batched two-axis window scatter: vmap introduces an
+            # input_batching_dim that must become an explicit dynamic-slice
+            # axis alongside the two window starts (jax-mps#124).
+            OperationTestConfig(
+                lambda x, y, row, col: jax.vmap(
+                    lambda a, b, i, j: lax.dynamic_update_slice(a, b, (i, j))
+                )(x, y, row, col),
+                lambda key: jnp.zeros((3, 5, 6), dtype=jnp.float32),
+                lambda key: random.normal(key, (3, 2, 3)),
+                lambda key: jnp.array([0, 1, 2], dtype=jnp.int32),
+                lambda key: jnp.array([1, 2, 3], dtype=jnp.int32),
+                name="batched_multi_axis_window_scatter_set",
+            ),
+            # Batched two-axis window scatter in accumulate modes with static
+            # starts. JAX folds the vmap axis into the window here (no batching
+            # dims), so these guard the operand-rank-update path.
+            OperationTestConfig(
+                lambda x, y: jax.vmap(lambda a, b: a.at[1:3, 2:5].add(b))(x, y),
+                lambda key: random.normal(key, (3, 5, 6)),
+                lambda key: random.normal(key, (3, 2, 3)),
+                name="batched_multi_axis_window_scatter_add",
+            ),
+            OperationTestConfig(
+                lambda x, y: jax.vmap(lambda a, b: a.at[1:3, 2:5].multiply(b))(x, y),
+                lambda key: random.normal(key, (3, 5, 6)),
+                lambda key: random.normal(key, (3, 2, 3)),
+                name="batched_multi_axis_window_scatter_mul",
+            ),
+            # Accumulate modes with per-batch starts: vmap over batched indices
+            # yields input_batching_dims, so the current window must be read
+            # back with the lower-rank update right-aligned against the
+            # operand (jax-mps#124).
+            *[
+                OperationTestConfig(
+                    lambda x, y, idx, scatter=scatter: jax.vmap(
+                        lambda a, b, i: scatter(
+                            a, i, b, _WINDOW_2D_DNUMS, unique_indices=True
+                        )
+                    )(x, y, idx),
+                    lambda key: random.normal(key, (3, 5, 6)),
+                    lambda key: random.normal(key, (3, 2, 3)),
+                    lambda key: jnp.array([[0, 1], [1, 2], [3, 3]], dtype=jnp.int32),
+                    name=f"batched_multi_axis_window_scatter_{name}_dynamic",
+                )
+                for name, scatter in [
+                    ("add", lax.scatter_add),
+                    ("mul", lax.scatter_mul),
+                ]
+            ],
+            # Interior operand batching dim ([rows, batch, cols]): the update
+            # needs an explicit singleton at axis 1 rather than MLX's
+            # leading-axis broadcast (jax-mps#124).
+            *[
+                OperationTestConfig(
+                    lambda x, y, idx, scatter=scatter: scatter(
+                        x, idx, y, _WINDOW_2D_INTERIOR_BATCH_DNUMS, unique_indices=True
+                    ),
+                    lambda key: random.normal(key, (5, 3, 6)),
+                    lambda key: random.normal(key, (3, 2, 3)),
+                    lambda key: jnp.array([[0, 1], [1, 2], [3, 3]], dtype=jnp.int32),
+                    name=f"multi_axis_window_scatter_{name}_interior_batching_dim",
+                )
+                for name, scatter in [
+                    ("set", lax.scatter),
+                    ("add", lax.scatter_add),
+                    ("mul", lax.scatter_mul),
+                ]
+            ],
             # Window scatter gradient: backward pass of a slice gather creates
             # a scatter with non-inserted scatter dim and window size 1.
             OperationTestConfig(
