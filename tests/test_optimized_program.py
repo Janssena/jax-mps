@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 
@@ -148,3 +149,40 @@ def test_optimized_program_across_shapes(mps_device, fn, args):
     """The API must work for a range of programs, not just the happy path."""
     text = _optimized_hlo(mps_device, fn, *args)
     assert "ENTRY" in text
+
+
+def test_optimized_program_with_mhlo_custom_calls(mps_device):
+    """Programs with `mhlo.*` custom calls must convert to HLO.
+
+    JAX encodes CHLO ops without a StableHLO equivalent (`erf_inv`, `sinh`,
+    ...) as `stablehlo.custom_call @mhlo.*`, which XLA's StableHLO -> HLO
+    conversion rejects. JAX itself reads the optimized program on every
+    compile, so this would also spam stderr for e.g. `jax.random.normal`.
+    """
+    key = jax.random.key(0)
+    x = jnp.ones((8,), jnp.float32)
+
+    def fn(k, v):
+        return jax.random.normal(k, (16,)), jnp.sinh(v)
+
+    stablehlo_in = jax.jit(fn).lower(key, x).as_text()
+    assert "mhlo.erf_inv" in stablehlo_in, "JAX no longer emits mhlo.erf_inv"
+
+    text = _optimized_hlo(mps_device, fn, key, x)
+    assert 'custom_call_target="mps.mhlo.erf_inv"' in text
+    assert 'custom_call_target="mps.mhlo.sinh"' in text
+
+
+def test_optimized_program_mhlo_custom_calls_round_trip(mps_device):
+    """The renamed `mps.mhlo.*` targets must still compile and run on MPS.
+
+    Consumers may compile the optimized program again, so the plugin has to
+    accept the targets it reports.
+    """
+    x = jnp.linspace(-2.0, 2.0, 8, dtype=jnp.float32)
+    fn = jax.ffi.ffi_call("mps.mhlo.sinh", jax.ShapeDtypeStruct(x.shape, x.dtype))
+    with jax.default_device(mps_device):
+        stablehlo_in = jax.jit(fn).lower(x).as_text()
+        assert "@mps.mhlo.sinh" in stablehlo_in
+        result = jax.jit(fn)(x)
+    np.testing.assert_allclose(result, np.sinh(np.asarray(x)), rtol=1e-6)
